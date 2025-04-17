@@ -15,23 +15,49 @@ const baseURL = "https://generativelanguage.googleapis.com/v1beta/openai/";
 
 // 创建聊天
 oai.post('/chat/completions', async (c) => {
-    const {messages, model, tools, tool_choice, stream = false} = await c.req.json() as ChatCompletionCreateParams & {
+    const {messages, model: originalModel, tools: originalTools, tool_choice, stream = false} = await c.req.json() as ChatCompletionCreateParams & {
         stream?: boolean
     };
 
     try {
+        // --- Google Search Tool Injection Logic ---
+        let actualModelId = originalModel;
+        let finalTools = originalTools; // Initialize with original tools
+        const isSearchModel = originalModel.endsWith('-search');
+
+        if (isSearchModel) {
+            actualModelId = originalModel.replace('-search', '');
+            console.log(`Search model detected. Using base model: ${actualModelId}`);
+            const googleSearchTool = { type: "function", function: { name: "googleSearch", description: "Google Search" } }; // Correct format for OpenAI SDK tools
+
+            if (finalTools && Array.isArray(finalTools)) {
+                 // Check if googleSearchTool already exists to avoid duplicates (optional but good practice)
+                if (!finalTools.some(tool => tool.type === 'function' && tool.function.name === 'googleSearch')) {
+                    finalTools = [...finalTools, googleSearchTool];
+                }
+            } else {
+                finalTools = [googleSearchTool];
+            }
+            console.log('Injecting Google Search tool.');
+        }
+        // --- End Google Search Tool Injection Logic ---
+
         // 处理流式响应
         if (stream) {
             // 创建流式请求
             return streamSSE(c, async (stream) => {
                 try {
-                    const completion = await withRetry(model, async (key) => {
+                    const completion = await withRetry(actualModelId, async (key) => { // Use actualModelId for retry logic
                         const openai = new OpenAI({
                             apiKey: key, baseURL: baseURL
                         });
 
                         return await openai.chat.completions.create({
-                            model: model, messages: messages, tools: tools, tool_choice: tool_choice, stream: true,
+                            model: actualModelId, // Use actualModelId
+                            messages: messages,
+                            tools: finalTools, // Use finalTools
+                            tool_choice: tool_choice,
+                            stream: true,
                         });
                     });
 
@@ -52,13 +78,16 @@ oai.post('/chat/completions', async (c) => {
         }
 
         // 非流式响应
-        const response = await withRetry(model, async (key) => {
+        const response = await withRetry(actualModelId, async (key) => { // Use actualModelId for retry logic
             const openai = new OpenAI({
                 apiKey: key, baseURL: baseURL
             });
-            
+
             return await openai.chat.completions.create({
-                model: model, messages: messages, tools: tools, tool_choice: tool_choice,
+                 model: actualModelId, // Use actualModelId
+                 messages: messages,
+                 tools: finalTools, // Use finalTools
+                 tool_choice: tool_choice,
             });
         });
 
@@ -68,25 +97,48 @@ oai.post('/chat/completions', async (c) => {
         return createHonoErrorResponse(c, error);
     }
 })
-
 // 列出模型
 oai.get('/models', async (c) => {
     try {
-        const models = await withoutBalancing(async (key) => {
+        // 1. Fetch original models from upstream
+        const originalModelsResponse = await withoutBalancing(async (key) => {
             const openai = new OpenAI({
                 apiKey: key, baseURL: baseURL
             });
             return await openai.models.list();
         });
-        
+
+        const originalModelsData = originalModelsResponse.data || [];
+
+        // 2. Identify models eligible for -search suffix and create variants
+        const searchModelsData = originalModelsData
+            .filter(model =>
+                // Apply the rule: gemini-2.x or higher series
+                /^gemini-[2-9]\.\d/.test(model.id) &&
+                // Ensure it's not already a search model (though unlikely from upstream)
+                !model.id.endsWith('-search')
+            )
+            .map(model => ({
+                ...model, // Copy original properties
+                id: `${model.id}-search`, // Append -search
+                // Ensure 'created' and 'owned_by' are present if needed, copying from original
+                created: model.created || Math.floor(Date.now() / 1000),
+                owned_by: model.owned_by || "google",
+            }));
+
+        // 3. Combine original and search models
+        const combinedModelsData = [...originalModelsData, ...searchModelsData];
+
+        // 4. Return the combined list
         return c.json({
-            object: "list", data: models.data
+            object: "list", data: combinedModelsData
         });
     } catch (error: any) {
         console.error('获取模型错误:', error);
         return createHonoErrorResponse(c, error);
     }
 })
+
 
 // 检索模型
 oai.get('/models/:model', async (c) => {
