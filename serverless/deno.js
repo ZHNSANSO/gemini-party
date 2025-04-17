@@ -1,6 +1,6 @@
 /**
  * Gemini Party v1.1.0
- * 构建时间: 2025-04-13T03:50:35.826Z
+ * 构建时间: 2025-04-17T14:04:32.873Z
  * https://github.com/your-username/gemini-party
  */
 
@@ -17,7 +17,7 @@ import OpenAI from "npm:openai@4.92.1";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-var version = '1.1.0'; // 自动构建于 2025-04-13T03:50:35.827Z
+var version = '1.1.0'; // 自动构建于 2025-04-17T14:04:32.875Z
 try {
   if (typeof Deno === "undefined") {
     const __filename2 = fileURLToPath(import.meta.url);
@@ -373,10 +373,12 @@ class ApiKeyManager {
     return false;
   }
   async withRetry(model, apiCallFn, options = {}) {
+    const defaultMaxRetries = config.keyManagement.defaultMaxRetries;
+    const calculatedMaxRetries = defaultMaxRetries === -1 ? Infinity : Math.min(defaultMaxRetries, this.apiKeys.length);
     const balancingOptions = {
       recordUsage: options.recordUsage ?? true,
       useBlacklist: options.useBlacklist ?? true,
-      maxRetries: options.maxRetries ?? Math.min(config.keyManagement.defaultMaxRetries, this.apiKeys.length)
+      maxRetries: options.maxRetries ?? calculatedMaxRetries
     };
     let lastError = null;
     for (let retryCount = 0;retryCount < balancingOptions.maxRetries; retryCount++) {
@@ -836,20 +838,36 @@ var oai = new Hono2;
 oai.use("/*", openaiAuthMiddleware);
 var baseURL = "https://generativelanguage.googleapis.com/v1beta/openai/";
 oai.post("/chat/completions", async (c) => {
-  const { messages, model, tools, tool_choice, stream = false } = await c.req.json();
+  const { messages, model: originalModel, tools: originalTools, tool_choice, stream = false } = await c.req.json();
   try {
+    let actualModelId = originalModel;
+    let finalTools = originalTools;
+    const isSearchModel = originalModel.endsWith("-search");
+    if (isSearchModel) {
+      actualModelId = originalModel.replace("-search", "");
+      console.log(`Search model detected. Using base model: ${actualModelId}`);
+      const googleSearchTool = { type: "function", function: { name: "googleSearch", description: "Google Search" } };
+      if (finalTools && Array.isArray(finalTools)) {
+        if (!finalTools.some((tool) => tool.type === "function" && tool.function.name === "googleSearch")) {
+          finalTools = [...finalTools, googleSearchTool];
+        }
+      } else {
+        finalTools = [googleSearchTool];
+      }
+      console.log("Injecting Google Search tool.");
+    }
     if (stream) {
       return streamSSE2(c, async (stream2) => {
         try {
-          const completion = await withRetry(model, async (key) => {
+          const completion = await withRetry(actualModelId, async (key) => {
             const openai = new OpenAI2({
               apiKey: key,
               baseURL
             });
             return await openai.chat.completions.create({
-              model,
+              model: actualModelId,
               messages,
-              tools,
+              tools: finalTools,
               tool_choice,
               stream: true
             });
@@ -869,15 +887,15 @@ oai.post("/chat/completions", async (c) => {
         }
       });
     }
-    const response = await withRetry(model, async (key) => {
+    const response = await withRetry(actualModelId, async (key) => {
       const openai = new OpenAI2({
         apiKey: key,
         baseURL
       });
       return await openai.chat.completions.create({
-        model,
+        model: actualModelId,
         messages,
-        tools,
+        tools: finalTools,
         tool_choice
       });
     });
@@ -889,16 +907,24 @@ oai.post("/chat/completions", async (c) => {
 });
 oai.get("/models", async (c) => {
   try {
-    const models = await withoutBalancing(async (key) => {
+    const originalModelsResponse = await withoutBalancing(async (key) => {
       const openai = new OpenAI2({
         apiKey: key,
         baseURL
       });
       return await openai.models.list();
     });
+    const originalModelsData = originalModelsResponse.data || [];
+    const searchModelsData = originalModelsData.filter((model) => /^gemini-[2-9]\.\d/.test(model.id) && !model.id.endsWith("-search")).map((model) => ({
+      ...model,
+      id: `${model.id}-search`,
+      created: model.created || Math.floor(Date.now() / 1000),
+      owned_by: model.owned_by || "google"
+    }));
+    const combinedModelsData = [...originalModelsData, ...searchModelsData];
     return c.json({
       object: "list",
-      data: models.data
+      data: combinedModelsData
     });
   } catch (error) {
     console.error("获取模型错误:", error);
